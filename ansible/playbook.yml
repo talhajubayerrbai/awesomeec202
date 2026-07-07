@@ -2,46 +2,43 @@
 - name: Configure application server
   hosts: all
   become: true
+  gather_facts: true
+
   vars:
     app_dir: /opt/app
     app_user: appuser
-    python_bin: /usr/bin/python3
     venv_dir: /opt/app/.venv
-    gunicorn_bin: /opt/app/.venv/bin/gunicorn
-    app_port: 8000
+    project_name: "{{ project_name | default('app') }}"
 
   tasks:
     #  System packages 
-
     - name: Update apt cache
       ansible.builtin.apt:
         update_cache: true
         cache_valid_time: 3600
 
-    - name: Install system dependencies
+    - name: Install system packages
       ansible.builtin.apt:
         name:
           - python3
           - python3-pip
           - python3-venv
           - nginx
-          - curl
           - git
+          - curl
         state: present
 
-    #  Application user 
-
-    - name: Create application system user
+    #  App user 
+    - name: Create application user
       ansible.builtin.user:
         name: "{{ app_user }}"
         system: true
-        shell: /usr/sbin/nologin
+        shell: /bin/false
         home: "{{ app_dir }}"
         create_home: false
 
-    #  Application directory 
-
-    - name: Create application directory
+    #  App directory 
+    - name: Create app directory
       ansible.builtin.file:
         path: "{{ app_dir }}"
         state: directory
@@ -49,9 +46,8 @@
         group: "{{ app_user }}"
         mode: "0755"
 
-    #  Sync application code 
-
-    - name: Copy application package (app/)
+    #  Copy application code 
+    - name: Copy app package directory
       ansible.builtin.copy:
         src: "{{ playbook_dir }}/../app/"
         dest: "{{ app_dir }}/app/"
@@ -59,7 +55,7 @@
         group: "{{ app_user }}"
         mode: "0644"
 
-    - name: Copy main entrypoint (main.py)
+    - name: Copy main.py entrypoint
       ansible.builtin.copy:
         src: "{{ playbook_dir }}/../main.py"
         dest: "{{ app_dir }}/main.py"
@@ -71,10 +67,10 @@
       ansible.builtin.stat:
         path: "{{ playbook_dir }}/../requirements.txt"
       register: req_file
-      connection: local
+      delegate_to: localhost
       become: false
 
-    - name: Copy requirements.txt
+    - name: Copy requirements.txt if present
       ansible.builtin.copy:
         src: "{{ playbook_dir }}/../requirements.txt"
         dest: "{{ app_dir }}/requirements.txt"
@@ -87,10 +83,10 @@
       ansible.builtin.stat:
         path: "{{ playbook_dir }}/../public"
       register: public_dir
-      connection: local
+      delegate_to: localhost
       become: false
 
-    - name: Copy public/ static assets
+    - name: Copy public/ static assets if present
       ansible.builtin.copy:
         src: "{{ playbook_dir }}/../public/"
         dest: "{{ app_dir }}/public/"
@@ -99,70 +95,77 @@
         mode: "0644"
       when: public_dir.stat.exists
 
-    #  Python virtual environment 
-
+    #  Python virtual environment + dependencies 
     - name: Create Python virtual environment
       ansible.builtin.command:
-        cmd: "python3 -m venv {{ venv_dir }}"
+        cmd: python3 -m venv {{ venv_dir }}
         creates: "{{ venv_dir }}/bin/activate"
 
-    - name: Upgrade pip in venv
+    - name: Upgrade pip inside venv
       ansible.builtin.pip:
         name: pip
         state: latest
         virtualenv: "{{ venv_dir }}"
 
-    - name: Install fastapi and uvicorn (base deps)
+    - name: Install gunicorn and uvicorn
       ansible.builtin.pip:
         name:
-          - fastapi
-          - uvicorn[standard]
           - gunicorn
+          - uvicorn[standard]
         state: present
         virtualenv: "{{ venv_dir }}"
 
-    - name: Install application requirements
+    - name: Install app dependencies from requirements.txt
       ansible.builtin.pip:
         requirements: "{{ app_dir }}/requirements.txt"
         virtualenv: "{{ venv_dir }}"
       when: req_file.stat.exists
 
-    - name: Fix venv ownership
-      ansible.builtin.file:
-        path: "{{ venv_dir }}"
-        owner: "{{ app_user }}"
-        group: "{{ app_user }}"
-        recurse: true
+    - name: Install fastapi if no requirements.txt
+      ansible.builtin.pip:
+        name:
+          - fastapi
+          - python-multipart
+        state: present
+        virtualenv: "{{ venv_dir }}"
+      when: not req_file.stat.exists
 
-    - name: Fix app directory ownership
+    #  Fix ownership 
+    - name: Set ownership of app directory
       ansible.builtin.file:
         path: "{{ app_dir }}"
+        state: directory
+        recurse: true
         owner: "{{ app_user }}"
         group: "{{ app_user }}"
-        recurse: true
 
     #  Systemd service 
-
-    - name: Create systemd service unit for app
+    - name: Create systemd service unit
       ansible.builtin.copy:
         dest: /etc/systemd/system/app.service
         mode: "0644"
         content: |
           [Unit]
-          Description=FastAPI application (gunicorn)
+          Description={{ project_name }} FastAPI application
           After=network.target
 
           [Service]
-          Type=notify
+          Type=simple
           User={{ app_user }}
           Group={{ app_user }}
           WorkingDirectory={{ app_dir }}
-          ExecStart={{ gunicorn_bin }} app.main:app -k uvicorn.workers.UvicornWorker -w 4 -b 0.0.0.0:{{ app_port }}
-          Restart=on-failure
+          Environment=PATH={{ venv_dir }}/bin:/usr/local/bin:/usr/bin:/bin
+          Environment=PORT=8000
+          ExecStart={{ venv_dir }}/bin/gunicorn app.main:app \
+            -k uvicorn.workers.UvicornWorker \
+            -w 4 \
+            -b 0.0.0.0:8000 \
+            --access-logfile - \
+            --error-logfile -
+          Restart=always
           RestartSec=5
           StandardOutput=journal
           StandardError=journal
-          SyslogIdentifier=app
 
           [Install]
           WantedBy=multi-user.target
@@ -173,28 +176,27 @@
 
     - name: Enable and start app service
       ansible.builtin.systemd:
-        name: app
-        state: restarted
+        name: app.service
         enabled: true
+        state: started
 
     #  Nginx reverse proxy 
-
-    - name: Remove default Nginx site
+    - name: Remove default nginx site
       ansible.builtin.file:
         path: /etc/nginx/sites-enabled/default
         state: absent
 
-    - name: Write Nginx site config
+    - name: Write nginx app config
       ansible.builtin.copy:
         dest: /etc/nginx/sites-available/app
         mode: "0644"
         content: |
           server {
-              listen 80 default_server;
+              listen 80;
               server_name _;
 
               location / {
-                  proxy_pass         http://127.0.0.1:{{ app_port }};
+                  proxy_pass         http://127.0.0.1:8000;
                   proxy_http_version 1.1;
                   proxy_set_header   Upgrade $http_upgrade;
                   proxy_set_header   Connection "upgrade";
@@ -202,36 +204,28 @@
                   proxy_set_header   X-Real-IP $remote_addr;
                   proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
                   proxy_set_header   X-Forwarded-Proto $scheme;
-                  proxy_read_timeout 300;
-                  proxy_connect_timeout 300;
+                  proxy_read_timeout 300s;
               }
           }
 
-    - name: Enable Nginx site
+    - name: Enable nginx app site
       ansible.builtin.file:
         src: /etc/nginx/sites-available/app
         dest: /etc/nginx/sites-enabled/app
         state: link
 
-    - name: Test Nginx configuration
+    - name: Test nginx configuration
       ansible.builtin.command: nginx -t
       changed_when: false
 
-    - name: Enable and restart Nginx
+    - name: Enable and restart nginx
       ansible.builtin.systemd:
         name: nginx
-        state: restarted
         enabled: true
+        state: restarted
 
-    #  Local health check 
-
-    - name: Wait for app to be healthy locally
-      ansible.builtin.uri:
-        url: "http://127.0.0.1:{{ app_port }}/health"
-        method: GET
-        status_code: [200, 307]
-        follow_redirects: all
-      register: health_result
-      retries: 12
-      delay: 10
-      until: health_result.status in [200, 307]
+    #  Restart app after everything is in place 
+    - name: Restart app service to ensure latest code is running
+      ansible.builtin.systemd:
+        name: app.service
+        state: restarted

@@ -8,25 +8,18 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
-          pip install pytest pytest-asyncio httpx || true
-
-      - name: Lint (advisory only)
-        run: |
-          pip install flake8 || true
-          flake8 . --max-line-length=120 || true
-        continue-on-error: true
+          pip install pytest || true
 
       - name: Run tests
         run: |
@@ -37,11 +30,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: [test]
     outputs:
-      instance_id: ${{ steps.tf_output.outputs.instance_id }}
-
+      instance_id: ${{ steps.tf_outputs.outputs.instance_id }}
+      alb_dns_name: ${{ steps.tf_outputs.outputs.alb_dns_name }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -72,21 +64,19 @@ jobs:
             -var="aws_region=${{ secrets.AWS_REGION }}" \
             -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}"
 
-      - name: Capture Terraform outputs
-        id: tf_output
+      - name: Capture Terraform Outputs
+        id: tf_outputs
         working-directory: terraform
         run: |
-          INSTANCE_ID=$(terraform output -raw instance_id)
-          echo "instance_id=${INSTANCE_ID}" >> "$GITHUB_OUTPUT"
+          echo "instance_id=$(terraform output -raw instance_id)" >> "$GITHUB_OUTPUT"
+          echo "alb_dns_name=$(terraform output -raw alb_dns_name)" >> "$GITHUB_OUTPUT"
 
   configure:
     name: Configure
     runs-on: ubuntu-latest
     needs: [provision]
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -95,43 +85,28 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
+      - name: Set up Python (for Ansible)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Ansible and AWS SSM plugin
+        run: |
+          python -m pip install --upgrade pip
+          pip install ansible boto3 botocore
+          # Install the AWS SSM session manager plugin
+          curl -sSL "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" \
+            -o /tmp/session-manager-plugin.deb
+          sudo dpkg -i /tmp/session-manager-plugin.deb
+          ansible-galaxy collection install amazon.aws community.aws
+
       - name: Write SSH private key
         run: |
           mkdir -p ~/.ssh
           printf '%s' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
 
-      - name: Install Ansible and boto3
-        run: |
-          python -m pip install --upgrade pip
-          pip install ansible boto3 botocore
-
-      - name: Install SSM Ansible plugin
-        run: |
-          ansible-galaxy collection install amazon.aws community.aws
-
-      - name: Wait for SSM agent to be ready
-        run: |
-          INSTANCE_ID="${{ needs.provision.outputs.instance_id }}"
-          echo "Waiting for SSM registration of ${INSTANCE_ID}..."
-          for i in $(seq 1 30); do
-            STATUS=$(aws ssm describe-instance-information \
-              --filters "Key=InstanceIds,Values=${INSTANCE_ID}" \
-              --query 'InstanceInformationList[0].PingStatus' \
-              --output text 2>/dev/null || echo "None")
-            echo "Attempt ${i}: SSM status = ${STATUS}"
-            if [ "${STATUS}" = "Online" ]; then
-              echo "SSM agent is online."
-              break
-            fi
-            sleep 15
-          done
-          if [ "${STATUS}" != "Online" ]; then
-            echo "ERROR: SSM agent did not come online in time."
-            exit 1
-          fi
-
-      - name: Run Ansible playbook
+      - name: Run Ansible Playbook via SSM
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
@@ -139,18 +114,16 @@ jobs:
           ansible-playbook ansible/playbook.yml \
             -i "${INSTANCE_ID}," \
             -e "ansible_connection=aws_ssm" \
-            -e "ansible_aws_ssm_bucket_name=${{ secrets.TF_STATE_BUCKET }}" \
             -e "ansible_aws_ssm_region=${{ secrets.AWS_REGION }}" \
-            -e "ansible_python_interpreter=/usr/bin/python3"
+            -e "ansible_aws_ssm_bucket_name=${{ secrets.TF_STATE_BUCKET }}" \
+            -e "project_name=${{ secrets.PROJECT_NAME }}"
 
   verify:
     name: Verify
     runs-on: ubuntu-latest
     needs: [configure]
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -173,25 +146,31 @@ jobs:
             -backend-config="region=${{ secrets.AWS_REGION }}" \
             -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
 
-      - name: Get ALB DNS from Terraform output
-        id: get_url
+      - name: Get ALB endpoint
+        id: get_endpoint
         working-directory: terraform
         run: |
-          APP_URL=$(terraform output -raw app_url)
-          echo "app_url=${APP_URL}" >> "$GITHUB_OUTPUT"
+          ALB_DNS=$(terraform output -raw alb_dns_name)
+          echo "alb_dns=${ALB_DNS}" >> "$GITHUB_OUTPUT"
 
-      - name: Smoke test - health endpoint
+      - name: Wait for ALB and app to be ready
+        run: |
+          echo "Waiting 60 seconds for ALB target health check to stabilise..."
+          sleep 60
+
+      - name: Smoke test
         run: |-
-          APP_URL="${{ steps.get_url.outputs.app_url }}"
-          echo "Probing ${APP_URL}/health ..."
-          for i in $(seq 1 20); do
-            STATUS=$(curl -Lsf -o /dev/null -w "%{http_code}" "${APP_URL}/health" || echo "000")
+          ALB_DNS="${{ steps.get_endpoint.outputs.alb_dns }}"
+          APP_URL="http://${ALB_DNS}/health/"
+          echo "Probing ${APP_URL}"
+          for i in $(seq 1 10); do
+            STATUS=$(curl -Lsf -o /dev/null -w "%{http_code}" --max-time 15 "${APP_URL}" || echo "000")
             echo "Attempt ${i}: HTTP ${STATUS}"
             if [[ "${STATUS}" =~ ^[23] ]]; then
-              echo "Health check passed with status ${STATUS}."
+              echo "App is healthy - deploy succeeded."
               exit 0
             fi
             sleep 15
           done
-          echo "ERROR: Health check failed after all retries. Last status: ${STATUS}"
+          echo "ERROR: App did not return 2xx/3xx after 10 attempts."
           exit 1
