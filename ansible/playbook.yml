@@ -71,7 +71,7 @@
       ansible.builtin.stat:
         path: "{{ playbook_dir }}/../requirements.txt"
       register: req_file
-      delegate_to: localhost
+      connection: local
       become: false
 
     - name: Copy requirements.txt
@@ -87,7 +87,7 @@
       ansible.builtin.stat:
         path: "{{ playbook_dir }}/../public"
       register: public_dir
-      delegate_to: localhost
+      connection: local
       become: false
 
     - name: Copy public/ static assets
