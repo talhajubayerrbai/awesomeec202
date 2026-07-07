@@ -9,6 +9,9 @@
     app_user: appuser
     venv_dir: /opt/app/.venv
     project_name: "{{ project_name | default('app') }}"
+    # These are passed in as -e flags from the workflow after checking locally
+    requirements_exists: false
+    public_dir_exists: false
 
   tasks:
     #  System packages 
@@ -63,15 +66,6 @@
         group: "{{ app_user }}"
         mode: "0644"
 
-    - name: Check if requirements.txt exists
-      ansible.builtin.stat:
-        path: "{{ playbook_dir }}/../requirements.txt"
-      register: req_file
-      delegate_to: localhost
-      become: false
-      vars:
-        ansible_connection: local
-
     - name: Copy requirements.txt if present
       ansible.builtin.copy:
         src: "{{ playbook_dir }}/../requirements.txt"
@@ -79,16 +73,7 @@
         owner: "{{ app_user }}"
         group: "{{ app_user }}"
         mode: "0644"
-      when: req_file.stat.exists
-
-    - name: Check if public/ directory exists
-      ansible.builtin.stat:
-        path: "{{ playbook_dir }}/../public"
-      register: public_dir
-      delegate_to: localhost
-      become: false
-      vars:
-        ansible_connection: local
+      when: requirements_exists | bool
 
     - name: Copy public/ static assets if present
       ansible.builtin.copy:
@@ -97,7 +82,7 @@
         owner: "{{ app_user }}"
         group: "{{ app_user }}"
         mode: "0644"
-      when: public_dir.stat.exists
+      when: public_dir_exists | bool
 
     #  Python virtual environment + dependencies 
     - name: Create Python virtual environment
@@ -123,7 +108,7 @@
       ansible.builtin.pip:
         requirements: "{{ app_dir }}/requirements.txt"
         virtualenv: "{{ venv_dir }}"
-      when: req_file.stat.exists
+      when: requirements_exists | bool
 
     - name: Install fastapi if no requirements.txt
       ansible.builtin.pip:
@@ -132,7 +117,7 @@
           - python-multipart
         state: present
         virtualenv: "{{ venv_dir }}"
-      when: not req_file.stat.exists
+      when: not (requirements_exists | bool)
 
     #  Fix ownership 
     - name: Set ownership of app directory
